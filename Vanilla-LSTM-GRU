@@ -32,7 +32,7 @@ def preprocess_stock_data(data, window_size=60, scaler=None, is_train=True):
 
     # Normalize numerical features
     numerical_features = ['Open', 'High', 'Low', 'Close', 'Volume']
-    if scaler is None:  # Fit scaler only on training data
+    if scaler is None:
         scaler = MinMaxScaler(feature_range=(0, 1))
         data[numerical_features] = scaler.fit_transform(data[numerical_features])
     else:  # Use provided scaler for validation/test data
@@ -41,8 +41,8 @@ def preprocess_stock_data(data, window_size=60, scaler=None, is_train=True):
     # Create sliding window features and targets
     X, y = [], []
     for i in range(window_size, len(data)):
-        X.append(data.loc[i-window_size:i-1, numerical_features].values)  # Past 'window_size' timesteps
-        y.append(data.loc[i, 'Close'])  # Target is the next timestep's Close price
+        X.append(data.loc[i-window_size:i-1, numerical_features].values)
+        y.append(data.loc[i, 'Close'])
 
     X = np.array(X)
     y = np.array(y)
@@ -63,8 +63,8 @@ X_combined, y_combined, scaler = preprocess_stock_data(combined_df, window_size=
 
 # Splitting dataset into 60-20-20 (training, validation, testing) 
 dataset_size = len(X_combined)
-train_size = int(0.6 * dataset_size)  # 60% for training
-val_size = int(0.2 * dataset_size)    # 20% for validation
+train_size = int(0.6 * dataset_size)
+val_size = int(0.2 * dataset_size)
 
 # Split data sequentially
 X_train, y_train = X_combined[:train_size], y_combined[:train_size]
@@ -113,14 +113,14 @@ class VanillaRNN(nn.Module):
         # Initialize hidden state
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         out, _ = self.rnn(x, h0)  # RNN forward pass
-        out = self.fc(out[:, -1, :])  # Take the output from the last time step
+        out = self.fc(out[:, -1, :])
         return out
 # Training the Vanilla RNN
 # Default Hyperparameters
-input_size = X_train.shape[2]  # Number of features
-hidden_size = 50  # Number of hidden units
-output_size = 1  # Predicting a single value
-num_layers = 1  # Single-layer RNN
+input_size = X_train.shape[2]
+hidden_size = 50
+output_size = 1
+num_layers = 1
 num_epochs = 50
 learning_rate = 0.001
 
@@ -229,7 +229,7 @@ for hidden_size, num_layers, learning_rate, batch_size in hyperparameter_grid:
     criterion = nn.MSELoss()
 
     # Training loop
-    for epoch in range(10):  # Use fewer epochs for quick tuning
+    for epoch in range(10):
         model.train()
         train_loss = 0.0
         for X_batch, y_batch in train_loader:
