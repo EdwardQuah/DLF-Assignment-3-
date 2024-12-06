@@ -1,0 +1,863 @@
+# Importing libraries
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, TensorDataset
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from itertools import product
+
+# Loading Datasets
+df_train = pd.read_csv("./archive/train.csv")
+df_test = pd.read_csv("./archive/test.csv")
+
+# Previewing Datasets
+df_train.head()
+df_test.head()
+
+# Defining a data preprocessing function
+# Data preprocessing 
+def preprocess_stock_data(data, window_size=60, scaler=None, is_train=True):
+    # Convert date column into 'datetime' dtype
+    data['Date'] = pd.to_datetime(data['Date'])
+    data = data.sort_values('Date').reset_index(drop=True)
+
+    # Removing commas and converting into float dtype
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        data[col] = data[col].replace(',', '', regex=True).astype(float)
+
+    # Normalize numerical features
+    numerical_features = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if scaler is None:  # Fit scaler only on training data
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        data[numerical_features] = scaler.fit_transform(data[numerical_features])
+    else:  # Use provided scaler for validation/test data
+        data[numerical_features] = scaler.transform(data[numerical_features])
+
+    # Create sliding window features and targets
+    X, y = [], []
+    for i in range(window_size, len(data)):
+        X.append(data.loc[i-window_size:i-1, numerical_features].values)  # Past 'window_size' timesteps
+        y.append(data.loc[i, 'Close'])  # Target is the next timestep's Close price
+
+    X = np.array(X)
+    y = np.array(y)
+
+    # Return the processed data and the scaler
+    if is_train:
+        return X, y, scaler
+    else:
+        return X, y
+
+# Splitting data into 60-20-20 sequential ratios
+# Combine training and testing dataset
+combined_df = pd.concat([df_train, df_test], axis=0).reset_index(drop=True)
+
+# Preprocess the combined dataset
+window_size = 60
+X_combined, y_combined, scaler = preprocess_stock_data(combined_df, window_size=window_size, is_train=True)
+
+# Splitting dataset into 60-20-20 (training, validation, testing) 
+dataset_size = len(X_combined)
+train_size = int(0.6 * dataset_size)  # 60% for training
+val_size = int(0.2 * dataset_size)    # 20% for validation
+
+# Split data sequentially
+X_train, y_train = X_combined[:train_size], y_combined[:train_size]
+X_val, y_val = X_combined[train_size:train_size+val_size], y_combined[train_size:train_size+val_size]
+X_test, y_test = X_combined[train_size+val_size:], y_combined[train_size+val_size:]
+
+# Print sizes for verification
+print(f"Training set: {X_train.shape}, {y_train.shape}")
+print(f"Validation set: {X_val.shape}, {y_val.shape}")
+print(f"Test set: {X_test.shape}, {y_test.shape}")
+
+# Batching data and using dataloaders for better suitability with neural networks
+# Defining a class and using dataloader to 'batch' data for better suitability with model
+class StockDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.X[idx], dtype=torch.float32), torch.tensor(self.y[idx], dtype=torch.float32).unsqueeze(-1)
+
+# Create datasets
+train_dataset = StockDataset(X_train, y_train)
+val_dataset = StockDataset(X_val, y_val)
+test_dataset = StockDataset(X_test, y_test)
+
+# Create DataLoaders
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# VANILLA RNN 
+# Define the Vanilla RNN model
+class VanillaRNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+        super(VanillaRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        # Initialize hidden state
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.rnn(x, h0)  # RNN forward pass
+        out = self.fc(out[:, -1, :])  # Take the output from the last time step
+        return out
+# Training the Vanilla RNN
+# Default Hyperparameters
+input_size = X_train.shape[2]  # Number of features
+hidden_size = 50  # Number of hidden units
+output_size = 1  # Predicting a single value
+num_layers = 1  # Single-layer RNN
+num_epochs = 50
+learning_rate = 0.001
+
+# Initialize the model, loss function, and optimizer
+device = torch.device("mps" if torch.cuda.is_available() else "cpu")
+model = VanillaRNN(input_size, hidden_size, output_size, num_layers).to(device)
+criterion = nn.MSELoss()  # Mean Squared Error for regression
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Training loop
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        # Forward pass
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    # Validation loop
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    # Print epoch summary
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Validation Loss: {val_loss/len(val_loader):.4f}")
+  
+# Evaluation on Test Set
+# Test the model
+model.eval()
+test_loss = 0.0
+predictions, actuals = [], []
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        test_loss += loss.item()
+
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.cpu().numpy())
+
+# Flatten predictions and actuals for comparison
+predictions = np.concatenate(predictions).flatten()
+actuals = np.concatenate(actuals).flatten()
+
+# Metrics 
+mse = mean_squared_error(actuals, predictions)
+mae = mean_absolute_error(actuals, predictions)
+r2 = r2_score(actuals, predictions)
+print(f"Mean Squared Error (MSE): {mse}")
+print(f"Mean Absolute Error (MAE): {mae}")
+print(f"R-Squared: {r2}")
+
+# Baseline Vanilla Plot
+# Baseline Plot 
+
+# Plot actual vs predicted values
+plt.figure(figsize=(12, 6))
+plt.plot(actuals, label="Actual")
+plt.plot(predictions, label="Predicted")
+plt.title("Actual vs Predicted Prices (Baseline Vanilla)")
+plt.xlabel("Time")
+plt.ylabel("Price")
+plt.legend()
+plt.show()
+
+
+# Tuning Vanilla RNN
+# Define hyperparameter grid
+hidden_sizes = [50, 100, 200]
+num_layers_list = [1, 2]
+learning_rates = [0.01, 0.001, 0.0001]
+batch_sizes = [16, 32, 64]
+
+# Define the hyperparameter grid
+hyperparameter_grid = list(product(hidden_sizes, num_layers_list, learning_rates, batch_sizes))
+
+# Initialize results storage
+results = []
+
+# Loop through each hyperparameter combination
+for hidden_size, num_layers, learning_rate, batch_size in hyperparameter_grid:
+    print(f"Training with hidden_size={hidden_size}, num_layers={num_layers}, learning_rate={learning_rate}, batch_size={batch_size}")
+
+    # Update the DataLoader with the new batch size
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Define the model
+    model = VanillaRNN(input_size, hidden_size, output_size, num_layers).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Training loop
+    for epoch in range(10):  # Use fewer epochs for quick tuning
+        model.train()
+        train_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+            # Forward pass
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        # Validation loop
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                val_loss += loss.item()
+
+        # Print epoch summary
+        print(f"Epoch [{epoch+1}/10], Train Loss: {train_loss/len(train_loader):.4f}, Validation Loss: {val_loss/len(val_loader):.4f}")
+
+    # Store the results
+    results.append({
+        'hidden_size': hidden_size,
+        'num_layers': num_layers,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'val_loss': val_loss / len(val_loader)
+    })
+
+# Sort results by validation loss
+results = sorted(results, key=lambda x: x['val_loss'])
+
+# Print the best configuration
+print("Best Configuration:", results[0])
+
+# Defining a new Vanilla RNN with optimal configuration
+# Define the final Vanilla RNN model with the best configuration
+final_model = VanillaRNN(input_size, hidden_size=200, output_size=1, num_layers=2).to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(final_model.parameters(), lr=0.001)
+
+# Adjust the DataLoader for the best batch size
+final_train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+final_val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+
+# Training loop and training 
+num_epochs = 50
+for epoch in range(num_epochs):
+    final_model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in final_train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        # Forward pass
+        outputs = final_model(X_batch)
+        loss = criterion(outputs, y_batch)
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    # Validation loop
+    final_model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in final_val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = final_model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    # Print epoch summary
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(final_train_loader):.4f}, Validation Loss: {val_loss/len(final_val_loader):.4f}")
+
+# Test the final model
+final_model.eval()
+test_loss = 0.0
+predictions, actuals = [], []
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = final_model(X_batch)
+        loss = criterion(outputs, y_batch)
+        test_loss += loss.item()
+
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.cpu().numpy())
+
+# Flatten predictions and actuals for comparison
+predictions = np.concatenate(predictions).flatten()
+actuals = np.concatenate(actuals).flatten()
+
+print(f"Test Loss: {test_loss/len(test_loader):.4f}")
+
+# Plot actual vs predicted values
+plt.figure(figsize=(12, 6))
+plt.plot(actuals, label="Actual", color="blue")
+plt.plot(predictions, label="Predicted", color="orange")
+plt.title("Actual vs Predicted Prices (Tuned Vanilla)")
+plt.xlabel("Time")
+plt.ylabel("Price")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Tuned Vanilla RNN metrics
+mse = mean_squared_error(actuals, predictions)
+mae = mean_absolute_error(actuals, predictions)
+r2 = r2_score(actuals, predictions)
+print(f"Mean Squared Error (MSE): {mse}")
+print(f"Mean Absolute Error (MAE): {mae}")
+print(f"R-Squared: {r2}")
+
+
+# LSTM 
+# Defining baseline LSTM
+# LSTM v2
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, dropout=0):
+        super(LSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)  # Hidden state
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)  # Cell state
+        out, _ = self.lstm(x, (h0, c0)) 
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Default hyperparameters
+input_size = X_train.shape[2]  
+hidden_size = 50               
+output_size = 1                
+num_layers = 1                
+dropout = 0.2                 
+learning_rate = 0.001          
+num_epochs = 50                
+
+model = LSTMModel(input_size, hidden_size, output_size, num_layers, dropout).to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Validation Loss: {val_loss/len(val_loader):.4f}")
+# Evaluate on the test set
+model.eval()
+test_loss = 0.0
+predictions, actuals = [], []
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        test_loss += loss.item()
+
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.cpu().numpy())
+
+# Flatten predictions and actuals for comparison
+predictions = np.concatenate(predictions).flatten()
+actuals = np.concatenate(actuals).flatten()
+
+print(f"Test Loss (MSE): {test_loss/len(test_loader):.4f}")
+print(f"Mean Absolute Error (MAE): {mae:.4f}")
+print(f"R-Squared: {r2:.4f}")
+
+# Plotting baseline LSTM
+plt.figure(figsize=(10, 6))
+plt.plot(actuals, label='Actual Prices', color='blue')
+plt.plot(predictions, label='Predicted Prices', color='orange', linestyle='--')
+plt.title('LSTM: Actual vs Predicted Stock Prices (Baseline LSTM)')
+plt.xlabel('Time Steps')
+plt.ylabel('Normalized Prices')
+plt.legend()
+plt.show()
+
+# Tuning LSTM
+# Define hyperparameter grid
+hidden_sizes = [50, 100, 200]
+num_layers_list = [1, 2, 3]
+dropout_rates = [0.2, 0.3, 0.5]
+learning_rates = [0.001, 0.0001]
+batch_sizes = [16, 32, 64]
+
+# Create combinations of hyperparameters
+hyperparameter_grid = list(product(hidden_sizes, num_layers_list, dropout_rates, learning_rates, batch_sizes))
+# Initialize results storage
+results = []
+for hidden_size, num_layers, dropout, learning_rate, batch_size in hyperparameter_grid:
+    print(f"Training with hidden_size={hidden_size}, num_layers={num_layers}, dropout={dropout}, learning_rate={learning_rate}, batch_size={batch_size}")
+
+    # Update DataLoader with new batch size
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Define the LSTM model
+    model = LSTMModel(input_size, hidden_size, output_size, num_layers, dropout).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Train the model
+    num_epochs = 10  # Use fewer epochs during tuning
+    for epoch in range(num_epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    # Evaluate on validation set
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    val_loss /= len(val_loader)
+    print(f"Validation Loss: {val_loss:.4f}")
+
+    # Store results
+    results.append({
+        'hidden_size': hidden_size,
+        'num_layers': num_layers,
+        'dropout': dropout,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'val_loss': val_loss
+    })
+
+# Sort results by validation loss
+results = sorted(results, key=lambda x: x['val_loss'])
+print("Best Configuration:", results[0])
+
+# Best hyperparameters from grid search
+best_config = results[0]
+hidden_size = best_config['hidden_size']
+num_layers = best_config['num_layers']
+dropout = best_config['dropout']
+learning_rate = best_config['learning_rate']
+batch_size = best_config['batch_size']
+
+# Update DataLoader with the best batch size
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+# Define and train the final model
+model = LSTMModel(input_size, hidden_size, output_size, num_layers, dropout).to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+criterion = nn.MSELoss()
+
+num_epochs = 50
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    # Validation loop
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Validation Loss: {val_loss/len(val_loader):.4f}")
+# Evaluate on the test set
+model.eval()
+test_loss = 0.0
+predictions, actuals = [], []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        test_loss += loss.item()
+
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.cpu().numpy())
+
+# Flatten predictions and actuals for comparison
+predictions = np.concatenate(predictions).flatten()
+actuals = np.concatenate(actuals).flatten()
+
+# Metrics
+mse = mean_squared_error(actuals, predictions)
+mae = mean_absolute_error(actuals, predictions)
+r2 = r2_score(actuals, predictions)
+print(f"Mean Squared Error (MSE): {mse}")
+print(f"Mean Absolute Error (MAE): {mae}")
+print(f"R-Squared: {r2}")
+
+# Plot Actual vs Predicted Prices
+plt.figure(figsize=(12, 6))
+plt.plot(actuals, label='Actual Prices', color='blue')
+plt.plot(predictions, label='Predicted Prices', color='orange', linestyle='--')
+plt.title('Actual vs Predicted Stock Prices (Tuned LSTM)')
+plt.xlabel('Time Steps')
+plt.ylabel('Price')
+plt.legend()
+plt.grid()
+plt.show()
+
+# GRU 
+# GRU v2
+class GRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, dropout=0):
+        super(GRUModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.gru(x, h0)
+        out = self.fc(out[:, -1, :])
+        return out
+# Hyperparameters
+input_size = X_train.shape[2]
+hidden_size = 50
+output_size = 1
+num_layers = 1
+dropout = 0.2
+learning_rate = 0.001
+num_epochs = 50     
+
+
+model = GRUModel(input_size, hidden_size, output_size, num_layers, dropout).to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+# Training baseline GRU
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        # Forward pass
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    # Validation loop
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Validation Loss: {val_loss/len(val_loader):.4f}")
+# Evaluate on the test set
+model.eval()
+test_loss = 0.0
+predictions, actuals = [], []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        test_loss += loss.item()
+
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.cpu().numpy())
+
+
+predictions = np.concatenate(predictions).flatten()
+actuals = np.concatenate(actuals).flatten()
+mse = test_loss / len(test_loader)
+mae = mean_absolute_error(actuals, predictions)
+r2 = r2_score(actuals, predictions)
+print(f"Test Loss (MSE): {mse:.4f}")
+print(f"Mean Absolute Error (MAE): {mae:.4f}")
+print(f"R-Squared: {r2:.4f}")
+
+# Plotting baseline GRU performance
+plt.figure(figsize=(12, 6))
+plt.plot(actuals, label='Actual Prices', color='blue')
+plt.plot(predictions, label='Predicted Prices', color='orange', linestyle='--')
+plt.title('Actual vs Predicted Stock Prices (Baseline GRU)')
+plt.xlabel('Time Steps')
+plt.ylabel('Normalized Prices')
+plt.legend()
+plt.grid()
+plt.show()
+
+# Tuning GRU 
+# Defining gridsearch parameter range 
+hidden_sizes = [50, 100, 200]
+num_layers_list = [1, 2, 3]
+dropout_rates = [0.2, 0.3, 0.5]
+learning_rates = [0.001, 0.0005, 0.0001]
+batch_sizes = [16, 32, 64]
+hyperparameter_grid = list(product(hidden_sizes, num_layers_list, dropout_rates, learning_rates, batch_sizes))
+  
+# Initialize results storage
+results = []
+for hidden_size, num_layers, dropout, learning_rate, batch_size in hyperparameter_grid:
+    print(f"Training with hidden_size={hidden_size}, num_layers={num_layers}, dropout={dropout}, learning_rate={learning_rate}, batch_size={batch_size}")
+
+    # Update DataLoader with new batch size
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Define the GRU model
+    model = GRUModel(input_size, hidden_size, output_size, num_layers, dropout).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Train the model
+    num_epochs = 10  # Use fewer epochs during tuning to save time
+    for epoch in range(num_epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    # Validate the model
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    val_loss /= len(val_loader)
+    print(f"Validation Loss: {val_loss:.4f}")
+
+    # Store results
+    results.append({
+        'hidden_size': hidden_size,
+        'num_layers': num_layers,
+        'dropout': dropout,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'val_loss': val_loss
+    })
+
+# Sort results by validation loss
+results = sorted(results, key=lambda x: x['val_loss'])
+print("Best Configuration:", results[0])
+
+# Initiating new GRU with best configuration
+# Best hyperparameters from grid search
+best_config = results[0]
+hidden_size = best_config['hidden_size']
+num_layers = best_config['num_layers']
+dropout = best_config['dropout']
+learning_rate = best_config['learning_rate']
+batch_size = best_config['batch_size']
+
+# Update DataLoader with best batch size
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+# Define the final model
+model = GRUModel(input_size, hidden_size, output_size, num_layers, dropout).to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+criterion = nn.MSELoss()
+
+num_epochs = 50
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    # Validate the model
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item()
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Validation Loss: {val_loss/len(val_loader):.4f}")
+# Test evaluation (same as before)
+model.eval()
+test_loss = 0.0
+predictions, actuals = [], []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        test_loss += loss.item()
+
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.cpu().numpy())
+
+# Flatten predictions and actuals
+predictions = np.concatenate(predictions).flatten()
+actuals = np.concatenate(actuals).flatten()
+
+# Calculate metrics
+mse = test_loss / len(test_loader)
+mae = mean_absolute_error(actuals, predictions)
+r2 = r2_score(actuals, predictions)
+
+print(f"Test Loss (MSE): {mse:.4f}")
+print(f"Mean Absolute Error (MAE): {mae:.4f}")
+print(f"R-Squared: {r2:.4f}")
+
+# Plotting tuned GRU performance
+plt.figure(figsize=(12, 6))
+plt.plot(actuals, label='Actual Prices', color='blue')
+plt.plot(predictions, label='Predicted Prices', color='orange', linestyle='--')
+plt.title('Actual vs Predicted Stock Prices (Tuned GRU)')
+plt.xlabel('Time Steps')
+plt.ylabel('Normalized Prices')
+plt.legend()
+plt.grid()
+plt.show()
+
+# Final run model performances 
+# BASE Vanilla
+# Mean Squared Error (MSE): 0.0002259401953779161
+# Mean Absolute Error (MAE): 0.011451463215053082
+# R-Squared: 0.9126322854250477
+
+# TUNED Vanilla
+# Mean Squared Error (MSE): 0.0003009033971466124
+# Mean Absolute Error (MAE): 0.013826078735291958
+# R-Squared: 0.8836451312674188
+
+# BASE LSTM
+# Test Loss (MSE): 0.0004
+# Mean Absolute Error (MAE): 0.0138
+# R-Squared: 0.8836
+
+# TUNED LSTM
+# Mean Squared Error (MSE): 0.00020819911151193082
+# Mean Absolute Error (MAE): 0.010640962049365044
+# R-Squared: 0.919492501771985
+
+# BASE GRU
+# Test Loss (MSE): 0.0003
+# Mean Absolute Error (MAE): 0.0152
+# R-Squared: 0.8723
+
+# TUNED GRU
+# Mean Squared Error (MSE): 0.000438192073488608
+# Mean Absolute Error (MAE): 0.018680592998862267
+# R-Squared: 0.8305576512823637
